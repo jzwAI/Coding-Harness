@@ -14,14 +14,14 @@ class AgentLoop:
     def run(self, user_message):
         agent = self.agent
         run_started_at = time.monotonic()
-        agent.memory.set_task_summary(user_message)
-        agent.record({"role": "user", "content": user_message, "created_at": now()})
+        agent.memory.set_task_summary(user_message)                                       # 把用户请求摘要写入记忆
+        agent.record({"role": "user", "content": user_message, "created_at": now()})      # 用户消息写入对话历史
 
-        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
-        task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)   # 创建任务状态追踪器
+        task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)   
         agent.current_task_state = task_state
         agent.current_run_dir = agent.run_store.start_run(task_state)
-        agent.emit_trace(
+        agent.emit_trace(               # 发出第一条 trace 事件
             task_state,
             "run_started",
             {
@@ -45,7 +45,7 @@ class AgentLoop:
             task_state.record_attempt()
             agent.run_store.write_task_state(task_state)
             prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
+            prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)  # 把工作区快照、对话历史、记忆、工具列表等拼成一条完整的 prompt，同时返回元数据（缓存 key、resume 状态等）
             agent.emit_trace(
                 task_state,
                 "prompt_built",
@@ -55,7 +55,7 @@ class AgentLoop:
                 },
             )
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")      # 工作区状态变了（fingerprint 不匹配），旧上下文可能过时
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -73,7 +73,7 @@ class AgentLoop:
                         "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
                     },
                 )
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")     # 跑在了不同的仓库/分支上
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -84,7 +84,7 @@ class AgentLoop:
                     },
                 )
             if prompt_metadata.get("budget_reductions"):
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="context_reduction")
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="context_reduction")        # 对话太长，需要压缩历史
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -110,12 +110,14 @@ class AgentLoop:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
+            # 把已经拼好的 Prompt 发给模型客户端（Model Client），让大模型生成回复，并返回原始输出（raw completion）
             raw = agent.model_client.complete(
-                prompt,
+                prompt,                   
                 agent.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
+                prompt_cache_key=prompt_cache_key,   # 提示词缓存
+                prompt_cache_retention=prompt_cache_retention,  # 缓存保留策略
             )
+
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
@@ -123,7 +125,8 @@ class AgentLoop:
                 prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
-            kind, payload = agent.parse(raw)
+            kind, payload = agent.parse(raw)           # kind：意图类型（tool / retry / answer）    payload： 该意图对应的具体参数或内容
+
             agent.emit_trace(
                 task_state,
                 "model_parsed",
@@ -140,9 +143,9 @@ class AgentLoop:
                 args = payload.get("args", {})
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
-                tool_result = agent.execute_tool(name, args)
+                tool_result = agent.execute_tool(name, args)    # 真正执行工具
                 result = tool_result.content
-                agent.record(
+                agent.record(                                   # 工具结果写入历史
                     {
                         "role": "tool",
                         "name": name,
@@ -163,7 +166,7 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")                # 建检查点
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -175,15 +178,15 @@ class AgentLoop:
                 )
                 continue
 
-            if kind == "retry":
+            if kind == "retry":                              #  如果是 "retry"：记录后回到循环顶部，不消耗 tool_steps。
                 agent.record({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
                 continue
 
             final = (payload or raw).strip()
             agent.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
-            agent.promote_durable_memory(user_message, final)
+            task_state.finish_success(final)                           # 标记任务成功
+            agent.promote_durable_memory(user_message, final)          # 从对话中提取长期记忆
             checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
             agent.run_store.write_task_state(task_state)
             agent.emit_trace(
@@ -205,7 +208,7 @@ class AgentLoop:
                 },
             )
             agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
-            return final
+            return final            # 返回给调用方（cli.main 或 one-shot）
 
         if attempts >= max_attempts and tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."

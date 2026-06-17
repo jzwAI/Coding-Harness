@@ -1,9 +1,13 @@
 """运行工件落盘。
 
-session.json 负责保存“可恢复的会话状态”；RunStore 负责保存“单次运行的审计工件”，
-例如 task_state、trace 和 report。两者分开后，恢复现场和复盘证据不会混在一起。
+session.json 负责保存“可恢复的会话状态”；
+RunStore 负责保存“单次运行的审计工件”，
+例如 task_state、trace 和 report。
+两者分开后，恢复现场和复盘证据不会混在一起。
 """
-
+"""
+用原子写 JSON 保存状态、用 JSONL 实时追加 trace，确保 Agent 跑崩了也能留下完整、可分析的运行证据。
+"""
 import json
 import tempfile
 from pathlib import Path
@@ -24,13 +28,13 @@ class RunStore:
         return self.root / _run_id(run_id)
 
     def task_state_path(self, run_id):
-        return self.run_dir(run_id) / "task_state.json"
+        return self.run_dir(run_id) / "task_state.json"        # 任务初始状态（可重跑）
 
     def trace_path(self, run_id):
-        return self.run_dir(run_id) / "trace.jsonl"
+        return self.run_dir(run_id) / "trace.jsonl"            # 执行过程事件流（工具调用、决策、错误）
 
     def report_path(self, run_id):
-        return self.run_dir(run_id) / "report.json"
+        return self.run_dir(run_id) / "report.json"            # 最终产出（答案 / 结果 / 评估）
 
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。

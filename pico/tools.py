@@ -67,7 +67,7 @@ TOOL_EXAMPLES = {
 
 def build_tool_registry(context):
     # 工具不是动态发现的，而是显式注册的。
-    # 这样模型看到的是一个有边界、可审计的动作集合。
+    # 这样模型看到的是一个有边界、可审计的动作集合
     tools = {
         name: {**spec, "run": partial(_TOOL_RUNNERS[name], context)}
         for name, spec in BASE_TOOL_SPECS.items()

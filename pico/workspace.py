@@ -43,13 +43,13 @@ def middle(text, limit):
 
 class WorkspaceContext:
     def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
-        self.cwd = cwd
-        self.repo_root = repo_root
-        self.branch = branch
-        self.default_branch = default_branch
-        self.status = status
-        self.recent_commits = recent_commits
-        self.project_docs = project_docs
+        self.cwd = cwd                        # agent 的起始工作目录
+        self.repo_root = repo_root            #  Git 仓库根目录
+        self.branch = branch                  # 当前分支名 
+        self.default_branch = default_branch  # 默认分支（通常是 main）
+        self.status = status                  # 工作区是否干净，有哪些改动
+        self.recent_commits = recent_commits  # 最近 5 条提交记录
+        self.project_docs = project_docs      # 项目级指引文件（截断 1200 字符）
 
     @classmethod
     def build(cls, cwd, repo_root_override=None):

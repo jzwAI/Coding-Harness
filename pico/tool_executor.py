@@ -44,6 +44,9 @@ class ToolExecutor:
 
     def execute(self, name, args):
         agent = self.agent
+
+        #  1. 工具白名单校验
+
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
             return ToolExecutionResult(
                 content=f"error: tool '{name}' is not allowed in this run",
@@ -56,6 +59,8 @@ class ToolExecutor:
             )
 
         tool = agent.tools.get(name)
+
+         # ---------- 2. 工具是否存在 ----------
         if tool is None:
             return ToolExecutionResult(
                 content=f"error: unknown tool '{name}'",
@@ -66,7 +71,7 @@ class ToolExecutor:
                     read_only=False,
                 ),
             )
-
+        # ---------- 3. 参数合法性校验 ----------
         try:
             agent.validate_tool(name, args)
         except Exception as exc:
@@ -85,7 +90,7 @@ class ToolExecutor:
                     read_only=not tool["risky"],
                 ),
             )
-
+         # ---------- 4. 防止重复调用 ----------
         if agent.repeated_tool_call(name, args):
             return ToolExecutionResult(
                 content=f"error: repeated identical tool call for {name}; choose a different tool or return a final answer",
@@ -96,7 +101,7 @@ class ToolExecutor:
                     read_only=not tool["risky"],
                 ),
             )
-
+         # ---------- 5. 高风险工具审批 ----------
         if tool["risky"] and not agent.approve(name, args):
             return ToolExecutionResult(
                 content=f"error: approval denied for {name}",
@@ -108,16 +113,22 @@ class ToolExecutor:
                     read_only=False,
                 ),
             )
+        # ---------- 6. 执行前：工作区快照 ----------
 
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
+            # ---------- 7. 真正执行工具 ----------
             content = clip(tool["run"](args))
+            # 执行后再次快照（仅高风险工具）
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
+            # 对比前后快照，计算影响路径与 diff
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             tool_status = "ok"
             tool_error_code = ""
+
+             # ---------- 8. shell 工具的特殊处理 ----------
             if name == "run_shell":
                 match = re.search(r"exit_code:\s*(-?\d+)", content)
                 exit_code = int(match.group(1)) if match else 0
@@ -127,6 +138,7 @@ class ToolExecutor:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+            # ---------- 9. 更新 Agent 记忆与审计 ----------
             agent.update_memory_after_tool(name, args, content)
             metadata = _metadata(
                 tool_status,

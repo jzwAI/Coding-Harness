@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-
+# 将 session（含历史记录、memory、checkpoint 等）序列化为 JSON 文件落盘
 
 class SessionStore:
     def __init__(self, root):

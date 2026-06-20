@@ -3,6 +3,7 @@ import json
 import locale as locale_module
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -490,7 +491,7 @@ class BenchmarkEvaluator:
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
         verifier = subprocess.run(
-            task["verifier"],
+            task["verifier"].replace("python3", sys.executable),
             cwd=fixture_copy_root,
             shell=True,
             capture_output=True,

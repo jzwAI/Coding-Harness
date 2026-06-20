@@ -257,3 +257,7 @@ uv run ruff check pico tests scripts
 ```
 
 内部代码现在按较轻的边界拆分：`pico/evaluation/` 放 benchmark 和 metrics，`pico/providers/` 放模型 provider client，`pico/features/` 放可选运行时能力。新代码应直接使用这些包路径；旧的 `pico.evaluator`、`pico.metrics`、`pico.models` 和 `pico.memory` import 不再作为公共入口保留。
+
+## 更新日志
+6.20
+- **Session 原子写入**：`SessionStore.save()` 改为先写临时文件再原子替换（与 `RunStore._write_json_atomic` 一致），避免进程中途崩溃时留下半截 JSON 导致会话状态丢失。

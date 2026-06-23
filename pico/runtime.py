@@ -659,9 +659,32 @@ class Pico:
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
-        # 这里支持两种工具格式：
-        # 1. <tool>...</tool> 里包 JSON，适合简短调用
-        # 2. XML 风格属性/子标签，适合写文件这类多行内容
+        # 这里支持三种工具格式：
+        # 1. <tools>...</tools> 里包 {"calls": [...]}，适合并行只读调用
+        # 2. <tool>...</tool> 里包 JSON，适合简短单次调用
+        # 3. XML 风格属性/子标签，适合写文件这类多行内容
+        if "<tools>" in raw and ("<final>" not in raw or raw.find("<tools>") < raw.find("<final>")):
+            body = Pico.extract(raw, "tools")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return "retry", Pico.retry_notice("<tools> body must be valid JSON")
+            if not isinstance(payload, dict) or "calls" not in payload:
+                return "retry", Pico.retry_notice('<tools> must contain {"calls": [...]}')
+            calls = payload["calls"]
+            if not isinstance(calls, list) or not calls:
+                return "retry", Pico.retry_notice("calls must be a non-empty array")
+            for i, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    return "retry", Pico.retry_notice(f"call at index {i} must be a JSON object")
+                if not str(call.get("name", "")).strip():
+                    return "retry", Pico.retry_notice(f"call at index {i} is missing a tool name")
+                args = call.get("args", {})
+                if args is None:
+                    call["args"] = {}
+                elif not isinstance(args, dict):
+                    return "retry", Pico.retry_notice(f"call at index {i} has invalid args")
+            return "tools", {"calls": calls}
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
             body = Pico.extract(raw, "tool")
             try:

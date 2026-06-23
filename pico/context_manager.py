@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Prompt 组装与上下文预算控制。
 
 这个模块负责决定：每一轮到底把多少 prefix、memory、相关笔记、历史
@@ -28,15 +30,13 @@
 
 """
 
-from __future__ import annotations
-
 import json
 from dataclasses import dataclass
 
 
-DEFAULT_TOTAL_BUDGET = 12000
+DEFAULT_TOTAL_BUDGET = 12400
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
+    "prefix": 4000,
     "memory": 1600,
     "relevant_memory": 1200,
     "history": 5200,

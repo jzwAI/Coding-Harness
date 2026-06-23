@@ -45,6 +45,8 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         [
             '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
             '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+            '<tools>{"calls":[{"name":"read_file","args":{"path":"src/main.py","start":1,"end":50}},{"name":"read_file","args":{"path":"src/utils.py","start":1,"end":50}}]}</tools>',
+            '<tools>{"calls":[{"name":"read_file","args":{"path":"src/main.py","start":1,"end":50}},{"name":"patch_file","args":{"path":"src/main.py","old_text":"TODO","new_text":"DONE"}}]}</tools>',
             '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
             '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
@@ -59,9 +61,12 @@ def build_prompt_prefix(workspace, tools, built_at=None):
 
         Rules:
         - Use tools instead of guessing about the workspace.
-        - Return exactly one <tool>...</tool> or one <final>...</final>.
+        - Return exactly one <tool>...</tool>, one <tools>...</tools>, or one <final>...</final>.
         - Tool calls must look like:
-          <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+          <tool>{{\"name\":\"tool_name\",\"args\":{{...}}}}</tool>
+        - For multiple read_file / search / list_files calls that are independent, batch them in one <tools> block:
+          <tools>{{\"calls\":[{{\"name\":\"read_file\",\"args\":{{...}}}},{{\"name\":\"search\",\"args\":{{...}}}}]}}</tools>
+        - write_file, patch_file, run_shell, and delegate may appear in <tools>; they run sequentially after all reads complete.
         - For write_file and patch_file with multi-line text, prefer XML style:
           <tool name="write_file" path="file.py"><content>...</content></tool>
         - Final answers must look like:

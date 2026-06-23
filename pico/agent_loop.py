@@ -178,6 +178,49 @@ class AgentLoop:
                 )
                 continue
 
+            if kind == "tools":
+                # 并行只读工具调用：一轮执行多个 read_file / search / list_files
+                calls = payload["calls"]
+                tool_steps += len(calls)
+                for call in calls:
+                    task_state.record_tool(call["name"])
+                tools_started_at = time.monotonic()
+                batch_result = agent.tool_executor.execute_batch(calls)
+                for i, call in enumerate(calls):
+                    name = str(call.get("name", "")).strip()
+                    args = call.get("args", {}) or {}
+                    agent.record(
+                        {
+                            "role": "tool",
+                            "name": name,
+                            "args": args,
+                            "content": batch_result,
+                            "created_at": now(),
+                        }
+                    )
+                agent.run_store.write_task_state(task_state)
+                agent.emit_trace(
+                    task_state,
+                    "tools_executed",
+                    {
+                        "call_count": len(calls),
+                        "names": [str(c.get("name", "")).strip() for c in calls],
+                        "result": clip(batch_result, 500),
+                        "duration_ms": int((time.monotonic() - tools_started_at) * 1000),
+                    },
+                )
+                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tools_executed")
+                agent.run_store.write_task_state(task_state)
+                agent.emit_trace(
+                    task_state,
+                    "checkpoint_created",
+                    {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "trigger": "tools_executed",
+                    },
+                )
+                continue
+
             if kind == "retry":                              #  如果是 "retry"：记录后回到循环顶部，不消耗 tool_steps。
                 agent.record({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)

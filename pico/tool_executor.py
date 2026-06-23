@@ -1,5 +1,6 @@
 """Structured tool execution for the agent runtime."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import re
 
@@ -38,9 +39,109 @@ def _metadata(
     return result
 
 
+READ_ONLY_TOOL_NAMES = {"read_file", "search", "list_files"}
+MAX_READ_WORKERS = 4
+MAX_READ_BATCH_SIZE = 8
+
+
 class ToolExecutor:
     def __init__(self, agent):
         self.agent = agent
+
+    def execute_batch(self, calls):
+        """分批执行工具调用：只读并行，写操作串行。
+
+        执行模型：
+        阶段 1 —— 所有只读工具（read_file / search / list_files）并行执行，
+                 利用 ThreadPoolExecutor 减少 IO 等待。
+        阶段 2 —— 非只读工具在阶段 1 全部完成后，按原始顺序逐个串行执行，
+                 每个都走完整的 validate → approve → execute → snapshot 链路。
+
+        为什么这样设计：
+        - 读操作互不依赖，并行化收益最大
+        - 写操作之间有潜在的副作用依赖（两个写同一文件），串行安全
+        - 写操作可能依赖读操作的结果（先读配置再改），所以写必须在读之后
+
+        输入 / 输出：
+        - 输入：`calls`，每个元素是 {"name": ..., "args": {...}}
+        - 输出：拼接后的文本结果，按原始顺序排列，每条以 [tool:...] 标记
+        """
+        agent = self.agent
+
+        if not calls or not isinstance(calls, list):
+            return "error: tools batch requires a non-empty calls array"
+
+        if len(calls) > MAX_READ_BATCH_SIZE:
+            return f"error: too many parallel calls ({len(calls)}), max is {MAX_READ_BATCH_SIZE}"
+
+        # 1. 按原始索引分离读/写，预校验所有调用
+        read_calls = []   # (original_index, name, args)
+        write_calls = []  # (original_index, name, args)
+
+        for i, call in enumerate(calls):
+            name = str(call.get("name", "")).strip()
+            args = call.get("args", {}) or {}
+            try:
+                agent.validate_tool(name, args)
+            except Exception as exc:
+                return f"error: invalid arguments for {name} at index {i}: {exc}"
+            if name in READ_ONLY_TOOL_NAMES:
+                read_calls.append((i, name, args))
+            else:
+                write_calls.append((i, name, args))
+
+        results = [None] * len(calls)
+
+        # ==== 阶段 2：并行执行只读调用 ====
+        if read_calls:
+            def _run_read(index, name, args):
+                try:
+                    result = agent.execute_tool(name, args)
+                    agent.update_memory_after_tool(name, args, result.content)
+                    agent.record_process_note_for_tool(name, dict(result.metadata))
+                    return index, result.content, dict(result.metadata)
+                except Exception as exc:
+                    return index, f"error: tool {name} failed: {exc}", {
+                        "tool_status": "error",
+                        "tool_error_code": "tool_failed",
+                        "risk_level": "low",
+                        "read_only": True,
+                        "affected_paths": [],
+                        "workspace_changed": False,
+                        "diff_summary": [],
+                    }
+
+            with ThreadPoolExecutor(max_workers=min(MAX_READ_WORKERS, len(read_calls))) as pool:
+                futures = [
+                    pool.submit(_run_read, idx, name, args)
+                    for idx, name, args in read_calls
+                ]
+                for future in as_completed(futures):
+                    index, content, metadata = future.result()
+                    results[index] = (content, metadata)
+
+        # ==== 阶段 3：串行执行非只读调用 ====
+        for idx, name, args in write_calls:
+            try:
+                result = agent.execute_tool(name, args)
+                agent.update_memory_after_tool(name, args, result.content)
+                agent.record_process_note_for_tool(name, dict(result.metadata))
+                results[idx] = (result.content, dict(result.metadata))
+            except Exception as exc:
+                results[idx] = (f"error: tool {name} failed: {exc}", {
+                    "tool_status": "error",
+                    "tool_error_code": "tool_failed",
+                })
+
+        # 4. 按原始顺序拼接结果
+        parts = []
+        for i, call in enumerate(calls):
+            name = str(call.get("name", "")).strip()
+            args = call.get("args", {}) or {}
+            content, _metadata = results[i]
+            parts.append(f"[tool:{name} args={args}]\n{content}")
+
+        return "\n\n".join(parts)
 
     def execute(self, name, args):
         agent = self.agent

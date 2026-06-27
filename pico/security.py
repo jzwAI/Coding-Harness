@@ -95,6 +95,7 @@ def shell_env(env=None, allowlist=(), root="."):
         if name in env
     }
     filtered["PWD"] = str(root)
+    filtered["PYTHONIOENCODING"] = "utf-8"
     if "PATH" not in filtered and env.get("PATH"):
         filtered["PATH"] = env["PATH"]
     return filtered

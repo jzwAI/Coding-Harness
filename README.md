@@ -259,14 +259,16 @@ uv run ruff check pico tests scripts
 内部代码现在按较轻的边界拆分：`pico/evaluation/` 放 benchmark 和 metrics，`pico/providers/` 放模型 provider client，`pico/features/` 放可选运行时能力。新代码应直接使用这些包路径；旧的 `pico.evaluator`、`pico.metrics`、`pico.models` 和 `pico.memory` import 不再作为公共入口保留。
 
 ## 更新日志
-# 6.20
-- **Session 原子写入**：`SessionStore.save()` 改为先写临时文件再原子替换（与 `RunStore._write_json_atomic` 一致），避免进程中途崩溃时留下半截 JSON 导致会话状态丢失。
+# 6.27
+- 打卡
 # 6.23
-- **工具批处理执行**：`ToolExecutor` 新增 `execute_batch()`。模型用 `<tools>{"calls": [...]}</tools>` 一次声明多个工具调用，runtime 分两个阶段执行：阶段 1 将所有 `read_file` / `search` / `list_files` 通过 `ThreadPoolExecutor`（max_workers=4）并行执行，阶段 2 将 `write_file` / `patch_file` / `run_shell` / `delegate` 在读取全部完成后按原始顺序逐个串行执行。这样既保证了 read-before-write 的安全性（写总能读到最新的读结果），又最大化了读 IO 的并行度。
+- **工具批处理执行**：`ToolExecutor` 新增 `execute_batch()`。模型用 `<tools>{"calls": [...]}</tools>` 一次声明多个工具调用，runtime 分两个阶段执行：阶段 1 将所有 `read_file` / `search` / `list_files` 通过 `ThreadPoolExecutor`（max_workers=4）并行执行，阶段 2 将 `write_file` / `patch_file` / `run_shell` / `delegate` 在读取全部完成后按原始顺序逐个串行执行。      读串行 550ms，并行2955ms。
 - **Prompt 适配**：system prompt 新增并行读取的规则说明与格式示例；prefix budget 从 3600 → 4000、总 budget 从 12000 → 12400，避免 checkpoint 等附加文本被截断。
 - **⚠ 已知潜在隐患**：
   - `shell=True` 命令注入：`run_shell` 仍以 `shell=True` 执行模型生成的字符串，$()、`` ` `` 等 shell 元字符可被利用。当前仅靠环境变量白名单和审批策略缓解，未做真正的进程隔离。
   - TOCTOU 双重路径解析：`validate_tool()` 和实际工具函数各自 resolve 路径，校验与使用之间存在窗口，可能被 symlink 替换绕过。修复方向：一次 resolve 后传 resolved path
   - 同步 IO 阻塞：整个 client 和 executor 仍使用 `urllib.request` + `subprocess.run` 同步模型，无法实现流式输出，工具执行期间 agent loop 完全卡住。
-  - 写操作串行执行：虽然 reads 已并行化，batch 内的 writes 仍逐个串行，且不同 batch 之间的 writes 仍需多轮往返，存在进一步并行化空间（需引入依赖 DAG 和冲突检测）。
-  - Windows 兼容性：部分测试依赖 `python` 命令名（而非 `python3` 或 `sys.executable`）、`tzdata` 包未安装、shell env 过滤在 Windows 上返回异常，存在跨平台未覆盖的边界。
+  - 写操作串行执行：虽然 reads 已并行化，batch 内的 writes 仍逐个串行，且不同 batch 之间的 writes 仍需多轮往返，存在进一步并行化空间（需引入依赖 DAG 和冲突检测）
+  
+# 6.20
+- **Session 原子写入**：`SessionStore.save()` 改为先写临时文件再原子替换（与 `RunStore._write_json_atomic` 一致），避免进程中途崩溃时留下半截 JSON 导致会话状态丢失。

@@ -186,6 +186,7 @@ def tool_search(context, args):
         raise ValueError("pattern must not be empty")
     path = context.path(args.get("path", "."))
 
+
     if shutil.which("rg"):
         # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
         result = subprocess.run(
@@ -193,6 +194,7 @@ def tool_search(context, args):
             cwd=context.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -223,6 +225,7 @@ def tool_run_shell(context, args):
         shell=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。

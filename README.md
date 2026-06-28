@@ -272,3 +272,4 @@ uv run ruff check pico tests scripts
   
 # 6.20
 - **Session 原子写入**：`SessionStore.save()` 改为先写临时文件再原子替换（与 `RunStore._write_json_atomic` 一致），避免进程中途崩溃时留下半截 JSON 导致会话状态丢失。
+<!-- commit 1: 2026-06-28_21:40:53 -->

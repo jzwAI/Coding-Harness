@@ -35,6 +35,11 @@ class SessionStore:
     def load(self, session_id):
         return json.loads(self.path(session_id).read_text(encoding="utf-8"))
 
+    def child_store(self):
+        # 子 agent 的 session 放到 children/ 子目录，与父 session 分开，
+        # 这样 latest()（只扫顶层 *.json、非递归）不会在父 agent 崩溃后误恢复成子会话。
+        return SessionStore(self.root / "children")
+
     def latest(self):
         files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
         return files[-1].stem if files else None

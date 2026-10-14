@@ -12,6 +12,7 @@ import sys
 import textwrap
 
 from .config import load_project_env, provider_env
+from .context_budget import DEFAULT_MAX_PROMPT_TOKENS, build_budget_profile
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -46,6 +47,7 @@ HELP_DETAILS = textwrap.dedent(
     /help    Show this help message.
     /memory  Show the agent's distilled working memory.
     /session Show the path to the saved session file.
+    /tasks   Show the latest multi-agent task board.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.
     """
@@ -61,6 +63,12 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+
+# 各 provider 的默认运行上限。远程模型给保守的 128k 窗口（实际窗口更大时用 --context-window 覆盖）；
+# 本地 Ollama 小模型保持旧版的小预算，避免 prompt 超出模型实际能处理的长度。
+DEFAULT_CONTEXT_WINDOWS = {"ollama": 8192, "openai": 128000, "anthropic": 128000, "deepseek": 128000}
+DEFAULT_MAX_NEW_TOKENS = {"ollama": 512, "openai": 4096, "anthropic": 4096, "deepseek": 4096}
+DEFAULT_MAX_STEPS = {"ollama": 6, "openai": 20, "anthropic": 20, "deepseek": 20}
 
 
 def _effective_model(args, provider):
@@ -87,6 +95,28 @@ def _effective_model(args, provider):
             return model
         return DEFAULT_DEEPSEEK_MODEL
     return DEFAULT_OLLAMA_MODEL
+
+
+def _context_window(args):
+    provider = getattr(args, "provider", "deepseek")
+    return int(getattr(args, "context_window", None) or DEFAULT_CONTEXT_WINDOWS.get(provider, 8192))
+
+
+def _resolve_runtime_limits(args):
+    """把 CLI 参数解析成 (max_steps, max_new_tokens, context_profile)。
+
+    显式参数优先；没传就按 provider 取默认值。context_profile 由窗口、
+    输出 token 和 prompt 上限共同决定，见 context_budget.build_budget_profile。
+    """
+    provider = getattr(args, "provider", "deepseek")
+    max_new_tokens = int(getattr(args, "max_new_tokens", None) or DEFAULT_MAX_NEW_TOKENS.get(provider, 512))
+    max_steps = int(getattr(args, "max_steps", None) or DEFAULT_MAX_STEPS.get(provider, 6))
+    profile = build_budget_profile(
+        _context_window(args),
+        max_new_tokens,
+        max_prompt_tokens=getattr(args, "max_prompt_tokens", None) or DEFAULT_MAX_PROMPT_TOKENS,
+    )
+    return max_steps, max_new_tokens, profile
 
 
 def _configured_secret_names(args):
@@ -154,6 +184,7 @@ def _build_model_client(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        num_ctx=_context_window(args),
     )
 
 
@@ -225,6 +256,13 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
     model = _build_model_client(args)
+    max_steps, max_new_tokens, context_profile = _resolve_runtime_limits(args)
+    orchestration_config = {
+        "max_concurrency": getattr(args, "max_concurrency", 3),
+        "max_total_steps": getattr(args, "max_total_steps", 120),
+        "max_total_prompt_tokens": getattr(args, "max_total_prompt_tokens", 2_000_000),
+        "max_tasks": getattr(args, "max_tasks", 24),
+    }
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -235,18 +273,22 @@ def build_agent(args):
             session_store=store,
             session_id=session_id,
             approval_policy=args.approval,
-            max_steps=args.max_steps,
-            max_new_tokens=args.max_new_tokens,
+            max_steps=max_steps,
+            max_new_tokens=max_new_tokens,
             secret_env_names=configured_secret_names,
+            context_profile=context_profile,
+            orchestration_config=orchestration_config,
         )
     return Pico(
         model_client=model,
         workspace=workspace,
         session_store=store,
         approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
+        max_steps=max_steps,
+        max_new_tokens=max_new_tokens,
         secret_env_names=configured_secret_names,
+        context_profile=context_profile,
+        orchestration_config=orchestration_config,
     )
 
 
@@ -276,15 +318,96 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Maximum tool/model iterations per request. Defaults to 6 for ollama and 20 for remote providers.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Maximum model output tokens per step. Defaults to 512 for ollama and 4096 for remote providers.",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=None,
+        help="Model context window in tokens. Defaults to 8192 for ollama and 128000 for remote providers.",
+    )
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=DEFAULT_MAX_PROMPT_TOKENS,
+        help="Upper bound for estimated prompt tokens per model call (cost / latency cap).",
+    )
+    parser.add_argument("--max-concurrency", type=int, default=3, help="Max sub-agents running in parallel during multi-agent orchestration.")
+    parser.add_argument("--max-total-steps", type=int, default=120, help="Global tool-step budget across all sub-agents in one orchestration.")
+    parser.add_argument("--max-total-prompt-tokens", type=int, default=2_000_000, help="Global estimated prompt-token budget across all sub-agents.")
+    parser.add_argument("--max-tasks", type=int, default=24, help="Max task attempts across one orchestration run.")
+    parser.add_argument("--runs-tree", default=None, metavar="RUN_ID", help="Print the run tree (parent + child runs) for RUN_ID and exit.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser
 
 
+def _latest_board_text(agent):
+    import json
+    runs_root = agent.run_store.root
+    boards = sorted(runs_root.glob("*/board.json"), key=lambda p: p.stat().st_mtime) if runs_root.exists() else []
+    if not boards:
+        return "no task board yet (run a multi-agent orchestration first)."
+    data = json.loads(boards[-1].read_text(encoding="utf-8"))
+    lines = [f"task board for run {data.get('run_id', '?')}:"]
+    for t in data.get("tasks", []):
+        deps = ("<-" + ",".join(t.get("depends_on", []))) if t.get("depends_on") else ""
+        reason = f" ({t['stop_reason']})" if t.get("stop_reason") else ""
+        lines.append(f"- {t['task_id']} [{t['role']}] {t['status']}{reason} {deps}  {t.get('goal','')[:80]}")
+    return "\n".join(lines)
+
+
+def render_run_tree(runs_root, run_id):
+    """根据各 run 的 report.json 里的 parent_run_id，打印一棵运行树。"""
+    import json
+    reports = {}
+    if runs_root.exists():
+        for path in runs_root.glob("*/report.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            rid = data.get("run_id") or path.parent.name
+            reports[rid] = data
+    children = {}
+    for rid, data in reports.items():
+        children.setdefault(data.get("parent_run_id", "") or None, []).append(rid)
+
+    out = []
+
+    def walk(rid, depth):
+        data = reports.get(rid, {})
+        role = data.get("role") or "orchestrator"
+        status = data.get("status", "?")
+        out.append("  " * depth + f"- {rid} [{role}] {status}")
+        for child in sorted(children.get(rid, [])):
+            walk(child, depth + 1)
+
+    if run_id not in reports:
+        return f"run {run_id!r} not found under {runs_root}"
+    walk(run_id, 0)
+    return "\n".join(out)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+
+    if getattr(args, "runs_tree", None):
+        from pathlib import Path
+        runs_root = Path(args.cwd).resolve() / ".pico" / "runs"
+        print(render_run_tree(runs_root, args.runs_tree))
+        return 0
+
     agent = build_agent(args)
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
@@ -324,6 +447,9 @@ def main(argv=None):
             continue
         if user_input == "/session":
             print(agent.session_path)
+            continue
+        if user_input == "/tasks":
+            print(_latest_board_text(agent))
             continue
         if user_input == "/reset":
             agent.reset()

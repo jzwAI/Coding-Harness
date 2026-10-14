@@ -1,5 +1,6 @@
 import os
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,27 @@ from pico import (
     WorkspaceContext,
     build_welcome,
 )
+
+
+WINDOWS_SHELL_ENV_NAMES = ("SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR")
+
+
+def python_command(script):
+    """生成一条在当前平台 shell 里能直接执行的 `python -c` 命令。
+
+    script 内部请只用单引号：Windows 的 cmd.exe 只认双引号，
+    list2cmdline 会把整段 script 包进一对双引号里。
+    """
+    if os.name == "nt":
+        return subprocess.list2cmdline([sys.executable, "-c", script])
+    return shlex.join([sys.executable, "-c", script])
+
+
+def windows_shell_env():
+    """clear=True 清空环境变量时，Windows 上至少要保留这几项，否则连 cmd.exe 都启动不了。"""
+    if os.name != "nt":
+        return {}
+    return {name: os.environ[name] for name in WINDOWS_SHELL_ENV_NAMES if name in os.environ}
 
 
 def build_workspace(tmp_path):
@@ -918,11 +940,17 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
 def test_trace_and_report_redact_secret_env_values(tmp_path):
     secret = "sk-test-secret-123"
-    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
+    shell_call = json.dumps(
+        {
+            "name": "run_shell",
+            "args": {"command": python_command("print('sk-test-secret-123', end='')"), "timeout": 20},
+        }
+    )
+    with patch.dict(os.environ, {"OPENAI_API_KEY": secret, **windows_shell_env()}, clear=True):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                f"<tool>{shell_call}</tool>",
                 "<final>Masked.</final>",
             ],
         )
@@ -1155,7 +1183,7 @@ def test_run_shell_nonzero_with_workspace_change_is_recorded_as_partial_success(
     result = agent.run_tool(
         "run_shell",
         {
-            "command": "printf 'changed\\n' > README.md && exit 1",
+            "command": python_command("from pathlib import Path; Path('README.md').write_text('changed'); raise SystemExit(1)"),
             "timeout": 20,
         },
     )
@@ -1430,7 +1458,7 @@ def test_partial_success_creates_process_note_for_exploration_history(tmp_path):
     agent.run_tool(
         "run_shell",
         {
-            "command": "printf 'changed\\n' > README.md && exit 1",
+            "command": python_command("from pathlib import Path; Path('README.md').write_text('changed'); raise SystemExit(1)"),
             "timeout": 20,
         },
     )

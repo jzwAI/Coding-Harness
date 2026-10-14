@@ -47,4 +47,9 @@ def test_shell_env_uses_allowlist_and_sets_pwd_with_path_fallback(tmp_path):
 
     filtered = shell_env(env=env, allowlist=("HOME",), root=tmp_path)
 
-    assert filtered == {"HOME": "/home/user", "PWD": str(tmp_path), "PATH": "/usr/bin"}
+    assert filtered == {
+        "HOME": "/home/user",
+        "PWD": str(tmp_path),
+        "PATH": "/usr/bin",
+        "PYTHONIOENCODING": "utf-8",
+    }

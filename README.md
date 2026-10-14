@@ -228,6 +228,7 @@ uv run pico --provider ollama --model qwen3.5:4b
 - `/help`：查看内置命令
 - `/memory`：查看提炼后的工作记忆
 - `/session`：查看当前会话文件路径
+- `/tasks`：查看最近一次多 agent 协作的任务看板
 - `/reset`：清空当前会话状态
 - `/exit` 或 `/quit`：退出 REPL
 
@@ -247,6 +248,93 @@ uv run pico --provider ollama --model qwen3.5:4b
 
 这些内容默认只保存在本地，不需要跟仓库一起提交。
 
+## 项目架构
+
+pico 的核心思路：**模型只负责"决策"，其余都交给 harness（包在模型外面的控制程序）。** 模型每轮只能提出一个动作申请（调用某个工具或给出最终答案），这些申请必须经过校验、审批、执行、记录的完整链路才会真正落到仓库上，每一步都写进可复盘的运行工件。
+
+### 一次 `ask()` 的控制循环
+
+单个 agent 的主循环（`pico/agent_loop.py`）是同步阻塞的，可以按"感知 → 决策 → 行动 → 记录"理解：
+
+1. **组装 prompt**：把稳定前缀（规则 + 工具表 + 工作区快照）、工作记忆、相关笔记、压缩后的历史、当前请求，按预算拼成一条完整 prompt。
+2. **调用模型**：同步请求模型后端，拿到原始输出。
+3. **解析**：把输出分成四类——单个工具调用 `<tool>`、批量只读调用 `<tools>`、格式错误需重试 `retry`、最终答案 `<final>`。
+4. **执行工具**：经过白名单 → 参数校验 → 重复调用拦截 → 高风险审批 → 执行前后工作区快照 diff 的完整护栏。
+5. **记录**：结果写入历史、精炼进工作记忆，并落 trace 事件、建 checkpoint。
+6. 回到第 1 步，直到给出最终答案，或触发停机条件（步数上限 / 重试上限 / 取消）。
+
+### 模块地图
+
+```
+pico/
+├── cli.py              启动与装配：参数 → .env → provider client → 工作区 → runtime
+├── runtime.py          Pico 运行时外观：组合各子系统、解析输出、安全策略、工具注册
+├── agent_loop.py       主循环：组 prompt → 调模型 → 解析 → 执行 → 记录
+├── context_manager.py  分段预算与逐步裁剪，产出 prompt 和 metadata
+├── context_budget.py   按模型窗口推算预算（字符预算 + token 上限两层）
+├── prompt_prefix.py    稳定前缀：规则 + 工具表 + 工作区快照，算 hash 当缓存键
+├── workspace.py        git 分支/状态/提交 + 项目文档 → 工作区快照与指纹
+├── tools.py            工具白名单、参数校验、执行函数
+├── tool_executor.py    工具执行链路；只读工具并行批处理，写操作串行
+├── tool_context.py     工具执行上下文（路径解析、shell 环境、委派句柄）
+├── checkpoint.py       checkpoint 链、文件新鲜度、运行环境比对、恢复状态
+├── security.py         环境变量白名单、密钥检测与脱敏
+├── session_store.py    .pico/sessions/*.json（可恢复的会话状态，原子写）
+├── run_store.py        .pico/runs/<id>/（审计工件：task_state / trace / report）
+├── task_state.py       单次运行的状态机（状态、停机原因、工具步数）
+├── features/memory.py  分层记忆：工作记忆 / 文件摘要 / 情节笔记 / 持久记忆
+├── providers/clients.py  统一的 complete() 接口：Ollama / OpenAI / Anthropic
+├── agents/             角色注册表 + 四类内置角色（多 agent）
+├── orchestration/      多 agent 编排：看板、交接、调度、预算、隔离、合并、黑板
+└── evaluation/         benchmark 评测器 + 消融/压测/多 agent 评测
+```
+
+### 分层上下文治理
+
+`context_manager` 决定每轮把多少内容送进模型。prompt 分五段，各有预算：prefix、memory、relevant_memory、history、current_request（当前请求永不裁剪）。超预算时按固定优先级收缩：先丢相关笔记，再压历史，然后才动记忆和规则。预算由 `context_budget` 按模型窗口推算，分字符和 token 两层上限；旧的固定 12400 字符预算作为 compact 模式保留。历史压缩分两档：最近若干条尽量保留，更早的 read_file 去重、有摘要就用摘要代替原文。每轮都记录各段的原始/渲染长度和裁剪日志，供复盘。
+
+### 分层记忆
+
+`features/memory` 把记忆分四层：**working**（当前任务摘要 + 最近接触的文件，滑动窗口）、**file_summaries**（读文件后的短摘要，带 sha256 新鲜度，文件改了就失效）、**episodic_notes**（最多 12 条跨轮笔记，按 tag/关键词/新鲜度召回 top-3，不用 embedding）、**durable**（`.pico/memory/`，有准入与拒收规则——像密钥、临时状态、超长输出会被拒收，同一主语的旧条目被新条目替换）。
+
+### Checkpoint 与恢复
+
+checkpoint 是一条带父指针的链，记录当前目标、卡点、下一步、关键文件及其新鲜度、运行环境。恢复时比对两样东西：文件 sha256 和运行环境字段（模型、工具签名、工作区指纹、审批策略等），判定出 no-checkpoint / full-valid / partial-stale / workspace-mismatch / schema-mismatch 五种状态，并把 checkpoint 文本注入 prefix 最前面。本质是"带校验的上下文重新锚定"，不是执行状态回放。
+
+### 工具护栏与安全
+
+每次工具调用都经过：白名单 → 工具是否存在 → 参数校验（报错附正确示例）→ 连续重复调用拦截 → 高风险工具审批（ask/auto/never，只读模式一律拒绝）→ 执行前工作区快照 → 执行 → 执行后快照 diff → 回写记忆与过程笔记。路径先 resolve 再锚定在仓库根下，防 `../` 和软链接逃逸；shell 只拿到环境变量白名单；密钥在 trace/report 落盘前脱敏。
+
+### 可观测性
+
+三类运行工件分工：`task_state.json`（原子写，记"跑到哪了"）、`trace.jsonl`（只追加，记"做了什么"）、`report.json`（记结果与关键指标）。会话状态（可恢复）和运行工件（可复盘）分开存，互不混淆。
+
+### 模型后端抽象
+
+`providers/clients` 把 HTTP、SSE、usage 字段差异都封装起来，对上层暴露统一的 `complete()`。支持三类协议（OpenAI Responses / Anthropic Messages / Ollama）、四个 provider（DeepSeek 复用 Anthropic 协议）。runtime 不感知后端差异。
+
+## 多 Agent 协作
+
+顶层 agent 可以把一个大任务拆给多个受限子 agent 并行完成。四类内置角色：explorer（只读调查）、worker（可写，限定文件范围）、reviewer（跑测试验收）、planner（只读规划）。角色定义在 `pico/agents/builtin/*.md`，可在仓库的 `.pico/agents/` 下新增或覆盖同名角色。
+
+编排通过几个内置工具完成（仅顶层 agent 可用，子 agent 拿不到，因此委派深度固定不超过 1）：
+
+- `plan_tasks`：把任务写入任务看板。每个任务含 `role`、`goal`、`acceptance`、`verify`、`depends_on`、`write_scope` 等字段。
+- `run_tasks`：执行就绪任务（依赖已满足的），默认最多 3 个并行，等这一批全部结束后返回每个任务的结果摘要。
+- `board`：查看当前任务看板。
+- `integrate` / `apply_integration`：把各 worker 分支合并、验证通过后应用回主工作区（git 仓库）。
+- `select_variant`：best-of-N 场景下手动择优。
+
+关键设计：
+
+- **隔离写入（git 仓库）**：每个 worker 在独立的 `git worktree` 和分支上改代码，互不干扰，也不碰主工作区；最后由 Integrator 合并、检查冲突与越界，`apply_integration` 应用回主工作区时需要审批。非 git 仓库自动退回“串行、直接写主工作区”。
+- **越界防护**：worker 只能改 `write_scope` 声明的文件；实际改动以 `git diff` 为准核验，越界的任务标记为 `scope_violation`，默认不合并。
+- **全局预算**：整次协作的总步数、估算 token、任务数都有上限，耗尽即停。用 `--max-concurrency`、`--max-total-steps`、`--max-tasks` 调整。
+- **结构化交接**：父 agent 给子 agent 下发 Brief（目标、验收、写范围、相关文件摘要），子 agent 回传结构化 Result；父 agent 的历史里每个任务只记一条摘要，完整过程留在子 run 目录。
+- **可复盘**：每次协作的任务看板存为 `.pico/runs/<run_id>/board.json`；`report.json` 带 `multi_agent` 汇总（任务数、并发峰值、加速比、冲突与越界次数）。用 `pico --runs-tree <run_id>` 查看父子运行树。
+
+设计细节见 `docs/architecture/multi-agent-v1-design.md`。
+
 ## 开发
 
 常用本地检查：
@@ -259,8 +347,13 @@ uv run ruff check pico tests scripts
 内部代码现在按较轻的边界拆分：`pico/evaluation/` 放 benchmark 和 metrics，`pico/providers/` 放模型 provider client，`pico/features/` 放可选运行时能力。新代码应直接使用这些包路径；旧的 `pico.evaluator`、`pico.metrics`、`pico.models` 和 `pico.memory` import 不再作为公共入口保留。
 
 ## 更新日志
-# 6.27
-- 打卡
+# 7.14b
+- **多 agent 协作增强（v2）**：子 agent 之间通过只追加的共享黑板（`post_note`/`read_notes`）和非阻塞信箱（`send_message`/`check_inbox`）交换信息，不直接对话以避免同步模型下的死锁；卡住时返回 `blocked`+`needs` 向上求助。组长侧 `run_tasks` 改为按波（wave）调度、每波返回结构化进度摘要，并可用 `amend_tasks`/`cancel_tasks`/`answer_need` 在波次之间调整计划、中止（但不改写）正在跑的任务。详见 `docs/architecture/multi-agent-v2-collaboration.md`。
+# 7.14
+- **多 agent 协作**：新增 `pico/orchestration/`（任务看板、上下文交接、并行调度、预算账本、审批串行化、取消、git worktree 隔离、分支合并、best-of-N）与 `pico/agents/`（角色注册表 + 四类内置角色）。顶层 agent 新增 `plan_tasks` / `run_tasks` / `board` / `integrate` / `apply_integration` / `select_variant` 工具；子 agent 不可编排，委派深度固定不超过 1。
+- **上下文预算**：预算改为按模型窗口推算（字符预算 + token 上限两层），最近历史窗口、单条上限、工具输出上限随预算放大；旧的固定预算作为 compact 模式保留，默认行为不变。
+- **Windows 兼容**：时区回退、验收命令不经 shell 执行、shell 环境保留系统必需变量、输出解码容错。
+- **前置修复**：批处理结果不再重复写入历史；记忆更新加锁；子 agent 独立 model_client 实例、禁写持久记忆、子 session 隔离并记录父子关联。
 # 6.23
 - **工具批处理执行**：`ToolExecutor` 新增 `execute_batch()`。模型用 `<tools>{"calls": [...]}</tools>` 一次声明多个工具调用，runtime 分两个阶段执行：阶段 1 将所有 `read_file` / `search` / `list_files` 通过 `ThreadPoolExecutor`（max_workers=4）并行执行，阶段 2 将 `write_file` / `patch_file` / `run_shell` / `delegate` 在读取全部完成后按原始顺序逐个串行执行。      读串行 550ms，并行2955ms。
 - **Prompt 适配**：system prompt 新增并行读取的规则说明与格式示例；prefix budget 从 3600 → 4000、总 budget 从 12000 → 12400，避免 checkpoint 等附加文本被截断。

@@ -1,13 +1,14 @@
 import hashlib
 import json
 import locale as locale_module
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
@@ -128,8 +129,56 @@ def _current_locale():
         return locale_module.getdefaultlocale()[0] or "C"
 
 
+# Windows 自带的 Python 没有 IANA 时区库（需要额外装 tzdata），ZoneInfo 会直接报错。
+# 评测只需要一个可复现的时间戳，所以对常用时区回退到固定 UTC 偏移，保持零依赖。
+_FIXED_UTC_OFFSET_HOURS = {"Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "UTC": 0, "Etc/UTC": 0}
+
+
+def _resolve_timezone(timezone_name):
+    try:
+        return ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        hours = _FIXED_UTC_OFFSET_HOURS.get(str(timezone_name))
+        if hours is None:
+            raise
+        return timezone(timedelta(hours=hours), name=str(timezone_name))
+
+
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    return datetime.now(_resolve_timezone(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+_SHELL_OPERATORS = {"&&", "||", "|", ";", ">", ">>", "<"}
+
+
+def _run_verifier(command, cwd):
+    """执行 benchmark 的 verifier 命令，Windows/Linux/macOS 行为一致。
+
+    verifier 是按 POSIX shell 写的（例如 python3 -c '...'）。Windows 的 cmd.exe
+    不认单引号，直接 shell=True 会解析失败。这里先按 POSIX 规则拆成 argv、
+    把 python/python3 换成当前解释器，再不经 shell 直接执行；
+    只有命令里真的用到管道、重定向这类 shell 语法时才退回 shell=True。
+    """
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        argv = []
+    if argv and not any(token in _SHELL_OPERATORS for token in argv):
+        if argv[0] in {"python", "python3"}:
+            argv[0] = sys.executable
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+        )
+    return subprocess.run(
+        command.replace("python3", sys.executable),
+        cwd=cwd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
 
 
 def _artifact_path_for_task(task):
@@ -491,14 +540,7 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
-        verifier = subprocess.run(
-            task["verifier"].replace("python3", sys.executable),
-            cwd=fixture_copy_root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        verifier = _run_verifier(task["verifier"], fixture_copy_root)
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0

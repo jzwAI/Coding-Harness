@@ -87,6 +87,11 @@ def redact_artifact(value, key=None, env=None, secret_env_names=None):
     return value
 
 
+# Windows 上这几个变量缺一个，cmd.exe 或子进程里的 Python 就起不来
+# （例如没有 SYSTEMROOT 时 Python 无法初始化随机数）。它们不含敏感信息，始终透传。
+WINDOWS_REQUIRED_ENV_NAMES = ("SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR")
+
+
 def shell_env(env=None, allowlist=(), root="."):
     env = os.environ if env is None else env
     filtered = {
@@ -94,6 +99,11 @@ def shell_env(env=None, allowlist=(), root="."):
         for name in allowlist
         if name in env
     }
+    if os.name == "nt":
+        for name in WINDOWS_REQUIRED_ENV_NAMES:
+            value = env.get(name)
+            if value and name not in filtered:
+                filtered[name] = value
     filtered["PWD"] = str(root)
     filtered["PYTHONIOENCODING"] = "utf-8"
     if "PATH" not in filtered and env.get("PATH"):

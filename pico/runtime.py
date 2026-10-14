@@ -8,6 +8,7 @@ import json
 import hashlib
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ from .session_store import SessionStore
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from . import tools as toolkit
-from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, MAX_TOOL_OUTPUT, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
@@ -68,8 +69,19 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        context_profile=None,
+        model_client_factory=None,
+        durable_memory_writes=True,
+        parent_run_id="",
+        role="",
+        cancel_event=None,
+        approval_broker=None,
+        orchestration_config=None,
+        collab=None,
     ):
         self.model_client = model_client
+        # 并行只读批处理时多个线程会同时更新 memory/session，用可重入锁串行化这些写操作。
+        self._state_lock = threading.RLock()
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
         self.session_store = session_store
@@ -85,6 +97,25 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        # 上下文预算配置；None 表示 compact（旧版固定预算）。
+        # 工具输出上限也跟着 profile 走：prompt 能装下更多内容时，单次读文件/跑命令的结果也不该还卡在 4000 字符。
+        self.context_profile = context_profile
+        self.tool_output_limit = int(context_profile.tool_output_chars) if context_profile is not None else MAX_TOOL_OUTPUT
+        # 每个子 agent 应新建自己的 model_client（见 spawn_delegate / 编排层），
+        # 避免父子共用实例时 last_completion_metadata 与 FakeModelClient.outputs 串扰。
+        self.model_client_factory = model_client_factory
+        # 子 agent 只能通过 Result.proposed_memory 建议记忆，不能直接写持久记忆。
+        self.durable_memory_writes = bool(durable_memory_writes)
+        self.parent_run_id = str(parent_run_id or "")
+        self.role = str(role or "")
+        # 协作取消信号：orchestrator 超预算/出错时置位，子 agent 在每轮开始检查后停机。
+        self.cancel_event = cancel_event
+        # 并行审批串行化（仅 approval_policy=="ask" 时用到）。
+        self.approval_broker = approval_broker
+        # 编排配置：{max_concurrency, max_total_steps, max_total_prompt_tokens, max_tasks, max_attempts}
+        self.orchestration_config = dict(orchestration_config or {})
+        # 协作句柄（CollabHandle）：仅子 agent 持有，提供黑板/信箱工具。
+        self.collab = collab
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -103,7 +134,7 @@ class Pico:
         self.tool_executor = ToolExecutor(self)
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
-        self.context_manager = ContextManager(self)
+        self.context_manager = ContextManager(self, profile=context_profile)
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
@@ -118,6 +149,8 @@ class Pico:
             "workspace_changed": False,
             "prefix_changed": False,
         }
+        # 多 agent 编排器，仅 depth==0 懒加载（见 orchestrator / build_tools）。
+        self._orchestrator = None
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -175,7 +208,159 @@ class Pico:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self.tool_context())
+        tools = toolkit.build_tool_registry(self.tool_context())
+        # 编排类工具只给顶层 agent，子 agent 拿不到，从而无法再编排（委派深度 <= 1）。
+        if self.depth == 0:
+            tools.update(self._orchestration_tool_specs())
+        # 协作工具（黑板/信箱）给持有 collab 句柄的子 agent：只共享数据，不含编排权。
+        if self.collab is not None:
+            tools.update(self._collaboration_tool_specs())
+        return tools
+
+    def _collaboration_tool_specs(self):
+        collab = self.collab
+
+        def _post(args):
+            args = args or {}
+            return collab.post_note(args.get("key", ""), args.get("text", ""),
+                                    evidence=args.get("evidence", ""), kind=args.get("kind", "note"))
+
+        def _read(args):
+            args = args or {}
+            return collab.read_notes(key_prefix=args.get("key_prefix", args.get("key", "")),
+                                     limit=int(args.get("limit", 20) or 20))
+
+        def _send(args):
+            args = args or {}
+            to_task = str(args.get("to_task", "")).strip()
+            if not to_task:
+                return "error: send_message requires 'to_task'"
+            return collab.send_message(to_task, args.get("text", ""))
+
+        def _inbox(args):
+            return collab.check_inbox()
+
+        return {
+            "post_note": {"schema": {"key": "str", "text": "str", "evidence": "str?"}, "risky": False,
+                          "description": "Post a finding/decision/interface note to the shared blackboard for other sub-agents to read.", "run": _post},
+            "read_notes": {"schema": {"key_prefix": "str?"}, "risky": False,
+                           "description": "Read notes from the shared blackboard, optionally filtered by key prefix.", "run": _read},
+            "send_message": {"schema": {"to_task": "str", "text": "str"}, "risky": False,
+                             "description": "Leave an async message in another task's inbox (non-blocking; no reply is waited for).", "run": _send},
+            "check_inbox": {"schema": {}, "risky": False,
+                            "description": "Read unread messages addressed to this task.", "run": _inbox},
+        }
+
+    def orchestrator(self):
+        if self._orchestrator is None:
+            from .orchestration import Orchestrator, BudgetLedger
+            from .agents import RoleRegistry
+            roles = RoleRegistry.load(user_dir=self.root / ".pico" / "agents")
+            cfg = self.orchestration_config
+            budget = BudgetLedger(
+                max_total_steps=cfg.get("max_total_steps", 120),
+                max_total_prompt_tokens=cfg.get("max_total_prompt_tokens", 2_000_000),
+                max_tasks=cfg.get("max_tasks", 24),
+                max_attempts=cfg.get("max_attempts", 5),
+            )
+            self._orchestrator = Orchestrator(
+                self, roles,
+                max_concurrency=cfg.get("max_concurrency", 3),
+                budget=budget,
+            )
+        return self._orchestrator
+
+    def _orchestration_tool_specs(self):
+        def _plan(args):
+            return self.orchestrator().plan_tasks((args or {}).get("tasks"))
+
+        def _run(args):
+            args = args or {}
+            selector = args.get("task_ids", args.get("tasks", "ready"))
+            mode = args.get("mode", "wave")
+            return self.orchestrator().run_tasks(selector, mode=mode)
+
+        def _amend(args):
+            return self.orchestrator().amend_tasks((args or {}).get("tasks"))
+
+        def _cancel(args):
+            args = args or {}
+            return self.orchestrator().cancel_tasks(args.get("task_ids", args.get("ids", [])), args.get("reason", ""))
+
+        def _answer(args):
+            args = args or {}
+            return self.orchestrator().answer_need(args.get("task_id", ""), args.get("text", ""))
+
+        def _board(args):
+            return self.orchestrator().board_view()
+
+        def _integrate(args):
+            args = args or {}
+            return self.orchestrator().integrate(args.get("task_ids", args.get("tasks", [])))
+
+        def _apply(args):
+            return self.orchestrator().apply_integration()
+
+        def _select(args):
+            args = args or {}
+            return self.orchestrator().select_variant(args.get("group", args.get("variant_of", "")), args.get("winner", ""))
+
+        return {
+            "plan_tasks": {
+                "schema": {"tasks": "list[task]"},
+                "risky": False,
+                "description": "Create or update the multi-agent task board. Each task: {task_id, role, goal, acceptance[], verify[], inputs{files[],facts[]}, depends_on[], write_scope[], max_attempts}.",
+                "run": _plan,
+            },
+            "run_tasks": {
+                "schema": {"task_ids": "list|'ready'", "mode": "'wave'|'all'"},
+                "risky": False,
+                "description": "Run one wave of ready tasks (mode='wave', default) or drain all ready tasks (mode='all'); returns a progress digest so you can adjust the plan between waves.",
+                "run": _run,
+            },
+            "amend_tasks": {
+                "schema": {"tasks": "list[task]"},
+                "risky": False,
+                "description": "Add new tasks or revise still-pending/blocked tasks' goal/acceptance/write_scope/depends_on. Done tasks cannot be changed.",
+                "run": _amend,
+            },
+            "cancel_tasks": {
+                "schema": {"task_ids": "list", "reason": "str"},
+                "risky": False,
+                "description": "Cancel pending/blocked tasks (and their dependents). Use to stop a wrong approach before replanning.",
+                "run": _cancel,
+            },
+            "answer_need": {
+                "schema": {"task_id": "str", "text": "str"},
+                "risky": False,
+                "description": "Answer a blocked task's open need and return it to pending so it can be retried with the answer in its brief.",
+                "run": _answer,
+            },
+            "board": {
+                "schema": {},
+                "risky": False,
+                "description": "Show the current task board.",
+                "run": _board,
+            },
+            "integrate": {
+                "schema": {"task_ids": "list"},
+                "risky": False,
+                "description": "Merge the given done worker branches into an integration worktree; reports conflicts or the integrated diff. (git repos only)",
+                "run": _integrate,
+            },
+            "apply_integration": {
+                "schema": {},
+                "risky": False,
+                "description": "Apply the integrated result back to the main workspace. Asks for approval and requires a passing reviewer (approval handled internally).",
+                "run": _apply,
+            },
+            "select_variant": {
+                "schema": {"group": "str", "winner": "str"},
+                "risky": False,
+                "description": "For a best-of-N variant group, keep the winner task and cancel the other done variants.",
+                "run": _select,
+            },
+        }
 
     @staticmethod
     def _normalize_allowed_tools(allowed_tools):
@@ -193,7 +378,9 @@ class Pico:
         unknown = [name for name in self.allowed_tools if name not in legal_names]
         if unknown:
             raise ValueError(f"unknown allowed tool: {', '.join(unknown)}")
-        allowed = set(self.allowed_tools)
+        # 协作工具（黑板/信箱）是能力无关的内建工具，不受角色 allowed_tools 限制。
+        collab_names = {"post_note", "read_notes", "send_message", "check_inbox"}
+        allowed = set(self.allowed_tools) | collab_names
         return {
             name: tool
             for name, tool in tools.items()
@@ -270,8 +457,9 @@ class Pico:
         return prompt
 
     def record(self, item):
-        self.session["history"].append(item)
-        self.session_path = self.session_store.save(self.session)
+        with self._state_lock:
+            self.session["history"].append(item)
+            self.session_path = self.session_store.save(self.session)
 
     @staticmethod
     def looks_sensitive_env_name(name):
@@ -407,17 +595,18 @@ class Pico:
         if not path:
             return
 
-        canonical_path = self.memory.canonical_path(path)
-        # 不是所有工具结果都进入工作记忆。
-        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
-        if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
-            self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
+        with self._state_lock:
+            canonical_path = self.memory.canonical_path(path)
+            # 不是所有工具结果都进入工作记忆。
+            # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
+            if name in {"read_file", "write_file", "patch_file"}:
+                self.memory.remember_file(canonical_path)
+            if name == "read_file":
+                summary = memorylib.summarize_read_result(result)
+                self.memory.set_file_summary(canonical_path, summary)
+                self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
+            elif name in {"write_file", "patch_file"}:
+                self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
@@ -435,8 +624,9 @@ class Pico:
         else:
             text = f"{name} rejected; choose a different action before retry"
         tags = ["process", status, *affected_paths]
-        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
-        self.session["memory"] = self.memory.to_dict()
+        with self._state_lock:
+            self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
+            self.session["memory"] = self.memory.to_dict()
 
     def reject_durable_reason(self, note_text):
         text = str(note_text or "").strip()
@@ -491,13 +681,20 @@ class Pico:
         return promotions, rejections
 
     def promote_durable_memory(self, user_message, final_answer):
-        promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
-        promoted, superseded = self.memory.promote_durable(promotions)
-        self.session["memory"] = self.memory.to_dict()
-        self.last_durable_promotions = promoted
-        self.last_durable_rejections = rejections
-        self.last_durable_superseded = superseded
-        return promoted, rejections, superseded
+        # 子 agent（durable_memory_writes=False）不写持久记忆，只能通过 Result.proposed_memory 提建议。
+        if not self.durable_memory_writes:
+            self.last_durable_promotions = []
+            self.last_durable_rejections = []
+            self.last_durable_superseded = []
+            return [], [], []
+        with self._state_lock:
+            promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
+            promoted, superseded = self.memory.promote_durable(promotions)
+            self.session["memory"] = self.memory.to_dict()
+            self.last_durable_promotions = promoted
+            self.last_durable_rejections = rejections
+            self.last_durable_superseded = superseded
+            return promoted, rejections, superseded
 
     def ask(self, user_message):
         from .agent_loop import AgentLoop
@@ -560,12 +757,15 @@ class Pico:
             "attempts": task_state.attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
+            "parent_run_id": self.parent_run_id,
+            "role": self.role,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
+            "multi_agent": self._orchestrator.summary() if self._orchestrator is not None else None,
         }
 
     def tool_example(self, name):
@@ -587,10 +787,13 @@ class Pico:
 
     def spawn_delegate(self, args):
         task = str(args.get("task", "")).strip()
+        # 子 agent 新建独立 client（有工厂时），避免与父共用实例串扰 usage/剧本。
+        child_client = self.model_client_factory() if self.model_client_factory else self.model_client
+        parent_run_id = self.current_task_state.run_id if getattr(self, "current_task_state", None) else ""
         child = Pico(
-            model_client=self.model_client,
+            model_client=child_client,
             workspace=self.workspace,
-            session_store=self.session_store,
+            session_store=self.session_store.child_store(),
             run_store=self.run_store,
             approval_policy="never",
             max_steps=int(args.get("max_steps", 3)),
@@ -600,11 +803,18 @@ class Pico:
             read_only=True,
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
+            context_profile=self.context_profile,
+            model_client_factory=self.model_client_factory,
+            durable_memory_writes=False,
+            parent_run_id=parent_run_id,
+            role="delegate",
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
+        child.session["parent_session_id"] = self.session["id"]
         child.session["memory"]["task"] = task
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
+        child.session_store.save(child.session)
         return "delegate_result:\n" + child.ask(task)
 
     def tool_list_files(self, args):
@@ -635,6 +845,10 @@ class Pico:
             return True
         if self.approval_policy == "never":
             return False
+        # 并行场景下，多个子 agent 的审批请求经 broker 串行化并标注来源。
+        if self.approval_broker is not None:
+            source = f"{self.role or 'agent'}"
+            return bool(self.approval_broker.request(source, name, args))
         try:
             answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
         except EOFError:

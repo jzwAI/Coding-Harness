@@ -26,21 +26,21 @@ from __future__ import annotations
   │  current_request             │  ← 当前用户请求，永远不裁剪
   │  (无限)                      │
   └──────────────────────────────┘
-          总预算: 12000 chars
+          总预算: 12400 chars（compact profile；scaled profile 按模型窗口等比例放大，见 context_budget.py）
 
 """
 
 import json
 from dataclasses import dataclass
 
-
-DEFAULT_TOTAL_BUDGET = 12400
-DEFAULT_SECTION_BUDGETS = {
-    "prefix": 4000,
-    "memory": 1600,
-    "relevant_memory": 1200,
-    "history": 5200,
-}
+# 预算数值统一放在 context_budget；这里重新导出旧名字，保持向后兼容。
+# compact profile = 旧版写死的 12400 字符预算；CLI 会按模型窗口生成更大的 scaled profile。
+from .context_budget import (  # noqa: F401
+    DEFAULT_SECTION_BUDGETS,
+    DEFAULT_TOTAL_BUDGET,
+    compact_profile,
+    estimate_tokens,
+)
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
     "memory": 400,
@@ -85,14 +85,24 @@ class ContextManager:
     def __init__(
         self,
         agent,
-        total_budget=DEFAULT_TOTAL_BUDGET,
+        total_budget=None,
         section_budgets=None,
         section_floors=None,
         reduction_order=None,
+        profile=None,
     ):
         self.agent = agent
-        self.total_budget = int(total_budget)
-        self.section_budgets = dict(DEFAULT_SECTION_BUDGETS)
+        # 不传 profile 时使用 compact（与旧版完全一致的预算），老测试和评测结果不变。
+        self.profile = profile if profile is not None else compact_profile()
+        self.total_budget = int(total_budget if total_budget is not None else self.profile.total_chars)
+        self.section_budgets = dict(self.profile.section_budgets)
+        # 这三项决定"最近窗口多大、每条历史能留多长"，必须跟总预算一起放大；
+        # 否则 history 预算再大，单条历史仍被 900 字符卡住，放大预算等于没放。
+        self.recent_window = int(self.profile.recent_window)
+        self.recent_line_limit = int(self.profile.recent_line_limit)
+        self.older_line_limit = int(self.profile.older_line_limit)
+        # 第二道上限：按估算 token 校验，主要防中文内容（1 字≈1 token）撑爆窗口。
+        self.token_budget = self.profile.token_budget
         if section_budgets:
             self.section_budgets.update({str(key): int(value) for key, value in section_budgets.items()})
         self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
@@ -139,7 +149,12 @@ class ContextManager:
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            # checkpoint 放在 prefix 最前面，而不是追加到末尾：
+            # prefix 超预算时按尾部裁剪，放前面能保证恢复用的 checkpoint 不被先裁掉
+            # （末尾相对低优先级的工作区文档会先被裁）。Phase 1 给顶层 agent 增加了
+            # plan_tasks/run_tasks/board 三个工具，prefix 变长，若仍追加在末尾会把
+            # checkpoint 挤出预算。
+            section_texts["prefix"] = checkpoint_text + "\n\n" + section_texts["prefix"]
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
@@ -156,9 +171,49 @@ class ContextManager:
                 user_message=user_message,
                 section_texts=section_texts,
             )
+            metadata.update(self._budget_metadata(prompt, self.total_budget))
             return prompt, metadata
 
         budgets = dict(self.section_budgets)
+        char_limit = self.total_budget
+        rendered, prompt, budgets, reduction_log = self._fit_to_char_limit(
+            section_texts, budgets, selected_notes, char_limit
+        )
+
+        # 第二道上限：字符预算满足之后，再按估算 token 校验一次。
+        # 超了就按比例收紧字符上限再裁一轮（最多 4 轮，仍受各段 floor 保护）。
+        token_rounds = 0
+        if self.token_budget:
+            estimated = estimate_tokens(prompt)
+            while estimated > self.token_budget and token_rounds < 4:
+                token_rounds += 1
+                tightened = int(len(prompt) * self.token_budget / estimated * 0.97)
+                char_limit = min(char_limit - 1, tightened)
+                rendered, prompt, budgets, extra_log = self._fit_to_char_limit(
+                    section_texts, budgets, selected_notes, char_limit
+                )
+                for entry in extra_log:
+                    entry["trigger"] = "token_budget"
+                reduction_log.extend(extra_log)
+                if not extra_log:
+                    break
+                estimated = estimate_tokens(prompt)
+
+        metadata = self._metadata(
+            prompt=prompt,
+            rendered=rendered,
+            budgets=budgets,
+            reduction_log=reduction_log,
+            selected_notes=selected_notes,
+            user_message=user_message,
+            section_texts=section_texts,
+        )
+        metadata.update(self._budget_metadata(prompt, char_limit, token_rounds))
+        return prompt, metadata
+
+    def _fit_to_char_limit(self, section_texts, budgets, selected_notes, char_limit):
+        """按固定顺序收缩各段预算，直到 prompt 不超过 char_limit，或所有段都已到 floor。"""
+        budgets = dict(budgets)
         rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
@@ -167,8 +222,8 @@ class ContextManager:
         # 这里的顺序体现了平台偏好：
         # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
-        while len(prompt) > self.total_budget:
-            overflow = len(prompt) - self.total_budget
+        while len(prompt) > char_limit:
+            overflow = len(prompt) - char_limit
             reduced = False
             for section in self.reduction_order:
                 floor = int(self.section_floors.get(section, 0))
@@ -193,17 +248,21 @@ class ContextManager:
                 break
             if not reduced:
                 break
+        return rendered, prompt, budgets, reduction_log
 
-        metadata = self._metadata(
-            prompt=prompt,
-            rendered=rendered,
-            budgets=budgets,
-            reduction_log=reduction_log,
-            selected_notes=selected_notes,
-            user_message=user_message,
-            section_texts=section_texts,
-        )
-        return prompt, metadata
+    def _budget_metadata(self, prompt, char_limit, token_rounds=0):
+        estimated = estimate_tokens(prompt)
+        return {
+            "budget_profile": self.profile.name,
+            "context_window_tokens": self.profile.context_window_tokens,
+            "effective_prompt_budget_chars": int(char_limit),
+            "prompt_tokens_estimate": estimated,
+            "prompt_token_budget": self.token_budget,
+            "prompt_over_token_budget": bool(self.token_budget) and estimated > int(self.token_budget),
+            "token_budget_rounds": int(token_rounds),
+            "history_recent_window": self.recent_window,
+            "history_recent_line_limit": self.recent_line_limit,
+        }
 
     def _render_sections_without_reduction(self, section_texts, selected_notes=None):
         selected_notes = selected_notes or []
@@ -337,7 +396,7 @@ class ContextManager:
             )
 
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
+        recent_window = self.recent_window
         recent_start = max(0, len(history) - recent_window)
         history_entries, history_details = self._compressed_history_entries(history, recent_start)
         rendered_entries = []
@@ -395,7 +454,7 @@ class ContextManager:
         for index, item in enumerate(history):
             recent = index >= recent_start
             if recent:
-                line_limit = 900
+                line_limit = self.recent_line_limit
                 entries.append(
                     {
                         "recent": True,
@@ -424,7 +483,7 @@ class ContextManager:
                 details["summarized_tool_count"] += 1
                 continue
 
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
+            entries.append({"recent": False, "lines": self._render_history_item(item, self.older_line_limit)})
 
         return entries, details
 
@@ -444,7 +503,7 @@ class ContextManager:
             lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
             summary = " | ".join(lines[:3]) if lines else "(empty)"
             return f"{command} -> {summary}"
-        return self._render_history_item(item, 60)[0]
+        return self._render_history_item(item, self.older_line_limit)[0]
 
     def _raw_history_text(self, history):
         if not history:

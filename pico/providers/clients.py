@@ -11,6 +11,8 @@ from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
+from ..aio import in_thread
+
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
 
 
@@ -29,16 +31,27 @@ class FakeModelClient:
             raise RuntimeError("fake model ran out of outputs")
         return self.outputs.pop(0)
 
+    async def complete_async(self, prompt, max_new_tokens, **kwargs):
+        # 无 IO，直接返回；仍是 async 以便异步路径统一 await。
+        return self.complete(prompt, max_new_tokens, **kwargs)
+
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, num_ctx=None):
         self.model = model
+        # Ollama 默认上下文窗口很小（与版本有关，常见 2k~4k），不显式传 num_ctx 时，
+        # 超出部分会被服务端静默截掉——pico 以为发了完整 prompt，模型其实只看到一部分。
+        self.num_ctx = int(num_ctx) if num_ctx else None
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
+
+    async def complete_async(self, prompt, max_new_tokens, *, prompt_cache_key=None, prompt_cache_retention=None):
+        # 把同步 complete（urllib + 重试）丢进线程池执行，await 而不阻塞事件循环。
+        return await in_thread(self.complete, prompt, max_new_tokens, prompt_cache_key=prompt_cache_key, prompt_cache_retention=prompt_cache_retention)
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
@@ -56,6 +69,8 @@ class OllamaModelClient:
                 "top_p": self.top_p,
             },
         }
+        if self.num_ctx:
+            payload["options"]["num_ctx"] = self.num_ctx
         request = urllib.request.Request(
             self.host + "/api/generate",
             data=json.dumps(payload).encode("utf-8"),
@@ -235,6 +250,10 @@ class OpenAICompatibleModelClient:
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
         self.last_completion_metadata = {}
 
+    async def complete_async(self, prompt, max_new_tokens, *, prompt_cache_key=None, prompt_cache_retention=None):
+        # 把同步 complete（urllib + 重试）丢进线程池执行，await 而不阻塞事件循环。
+        return await in_thread(self.complete, prompt, max_new_tokens, prompt_cache_key=prompt_cache_key, prompt_cache_retention=prompt_cache_retention)
+
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
 
@@ -368,6 +387,10 @@ class AnthropicCompatibleModelClient:
         self.timeout = timeout
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
+
+    async def complete_async(self, prompt, max_new_tokens, *, prompt_cache_key=None, prompt_cache_retention=None):
+        # 把同步 complete（urllib + 重试）丢进线程池执行，await 而不阻塞事件循环。
+        return await in_thread(self.complete, prompt, max_new_tokens, prompt_cache_key=prompt_cache_key, prompt_cache_retention=prompt_cache_retention)
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；

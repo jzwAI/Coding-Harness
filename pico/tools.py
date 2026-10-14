@@ -195,8 +195,9 @@ def tool_search(context, args):
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
-        return result.stdout.strip() or result.stderr.strip() or "(no matches)"
+        return (result.stdout or "").strip() or (result.stderr or "").strip() or "(no matches)"
 
     matches = []
     files = [path] if path.is_file() else [
@@ -226,6 +227,9 @@ def tool_run_shell(context, args):
         capture_output=True,
         text=True,
         encoding="utf-8",
+        # Windows 上 cmd 的报错信息是本地编码（GBK），严格按 utf-8 解码会在读取线程里失败，
+        # 导致 stdout/stderr 变成 None。用 replace 保证一定拿到字符串。
+        errors="replace",
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
@@ -235,9 +239,9 @@ def tool_run_shell(context, args):
         f"""\
         exit_code: {result.returncode}
         stdout:
-        {result.stdout.strip() or "(empty)"}
+        {(result.stdout or "").strip() or "(empty)"}
         stderr:
-        {result.stderr.strip() or "(empty)"}
+        {(result.stderr or "").strip() or "(empty)"}
         """
     ).strip()
 

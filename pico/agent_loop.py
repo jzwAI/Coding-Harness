@@ -41,6 +41,14 @@ class AgentLoop:
         # 4. 记录：把结果写回 history / task_state / trace / memory
         # 然后进入下一轮，直到停机条件满足
         while tool_steps < agent.max_steps and attempts < max_attempts:
+            # 协作取消：每轮开始先看信号，收到就立即停机（不再调用模型/工具）。
+            if getattr(agent, "cancel_event", None) is not None and agent.cancel_event.is_set():
+                final = "Cancelled by orchestrator."
+                task_state.stop_cancelled(final)
+                agent.record({"role": "assistant", "content": final, "created_at": now()})
+                agent.run_store.write_task_state(task_state)
+                agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
+                return final
             attempts += 1
             task_state.record_attempt()
             agent.run_store.write_task_state(task_state)
@@ -185,19 +193,21 @@ class AgentLoop:
                 for call in calls:
                     task_state.record_tool(call["name"])
                 tools_started_at = time.monotonic()
-                batch_result = agent.tool_executor.execute_batch(calls)
-                for i, call in enumerate(calls):
-                    name = str(call.get("name", "")).strip()
-                    args = call.get("args", {}) or {}
+                entries = agent.tool_executor.execute_batch(calls)
+                # 每个调用各记一条历史（旧实现把整段合并结果重复写 N 次，正好放大了上下文膨胀）。
+                for entry in entries:
                     agent.record(
                         {
                             "role": "tool",
-                            "name": name,
-                            "args": args,
-                            "content": batch_result,
+                            "name": entry["name"],
+                            "args": entry["args"],
+                            "content": entry["content"],
                             "created_at": now(),
                         }
                     )
+                batch_result = "\n\n".join(
+                    f"[tool:{entry['name']} args={entry['args']}]\n{entry['content']}" for entry in entries
+                )
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,

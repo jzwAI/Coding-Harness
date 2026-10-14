@@ -4,6 +4,7 @@ from collections import Counter
 
 import pytest
 
+from pico.evaluation import evaluator as evaluator_module
 from pico.evaluation.evaluator import (
     BenchmarkEvaluator,
     load_benchmark,
@@ -115,7 +116,10 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    # locale 记录的是"当前运行环境"，不同机器本来就不同（Linux 常见 C.UTF-8，
+    # 中文 Windows 是 Chinese (Simplified)_China.936），所以只校验它如实记录了当前值。
+    assert reproducibility["locale"] == evaluator_module._current_locale()
+    assert reproducibility["locale"]
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")
